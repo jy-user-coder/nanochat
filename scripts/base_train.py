@@ -531,20 +531,19 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    log_data = {
+        "step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/epoch": epoch,
+    }
+    wandb_run.log(log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

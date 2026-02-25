@@ -145,6 +145,92 @@ def muon_step_fused(
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+
+def _get_muon_magma_hparams(group: dict) -> tuple[bool, float, float, float, bool]:
+    use_magma = bool(group.get("magma", False))
+    survival_prob = float(group.get("survival_prob", 0.5))
+    temperature = float(group.get("temperature", 2.0))
+    ema_decay = float(group.get("ema_decay", 0.9))
+    unbiased = bool(group.get("unbiased", False))
+    if not use_magma:
+        return use_magma, survival_prob, temperature, ema_decay, unbiased
+    if not 0.0 < survival_prob <= 1.0:
+        raise ValueError(f"Invalid survival_prob for Muon+Magma: {survival_prob}")
+    if temperature <= 0.0:
+        raise ValueError(f"Invalid temperature for Muon+Magma: {temperature}")
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError(f"Invalid ema_decay for Muon+Magma: {ema_decay}")
+    return use_magma, survival_prob, temperature, ema_decay, unbiased
+
+
+def _muon_update_eager_(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    magma_scale: Tensor | None,
+    *,
+    momentum: float,
+    lr: float,
+    weight_decay: float,
+    beta2: float,
+    ns_steps: int,
+    red_dim: int,
+    use_magma: bool,
+    survival_prob: float,
+    temperature: float,
+    ema_decay: float,
+    unbiased: bool,
+) -> None:
+    momentum_buffer.lerp_(stacked_grads, 1.0 - momentum)
+    g = stacked_grads.lerp(momentum_buffer, momentum)
+
+    # Polar express
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+
+    # Variance reduction
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1.0 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    if use_magma:
+        assert magma_scale is not None
+        mom_f = momentum_buffer.float()
+        grad_f = stacked_grads.float()
+        dot = (mom_f * grad_f).sum(dim=(-2, -1))
+        denom = mom_f.norm(dim=(-2, -1)) * grad_f.norm(dim=(-2, -1))
+        cosine = (dot / denom.clamp_min(1e-12)).clamp(-1.0, 1.0)
+        align_score = torch.sigmoid(cosine / temperature)
+        magma_scale.mul_(ema_decay).add_(align_score.to(torch.float32), alpha=1.0 - ema_decay)
+        mask = (torch.rand_like(magma_scale) < survival_prob).to(torch.float32)
+        block_scale = magma_scale * mask
+        if unbiased:
+            block_scale.div_(survival_prob)
+        g = g * block_scale.to(g.dtype).view(-1, 1, 1)
+
+    scaled_lr = lr * max(1.0, stacked_params.shape[-2] / stacked_params.shape[-1]) ** 0.5
+    # Use regular (unmasked) decoupled weight decay for Muon+Magma updates.
+    stacked_params.sub_(scaled_lr * g + scaled_lr * weight_decay * stacked_params)
+
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
 # Used mostly for reference, debugging and testing.
@@ -174,6 +260,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+              Optional Muon+Magma keys: 'magma', 'survival_prob', 'temperature', 'ema_decay', 'unbiased'
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -257,25 +344,50 @@ class MuonAdamW(torch.optim.Optimizer):
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
 
-        # Fill all the 0-D tensors with current values
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
+        use_magma, survival_prob, temperature, ema_decay, unbiased = _get_muon_magma_hparams(group)
+        beta2 = group["beta2"] if group["beta2"] is not None else 0.0
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        muon_step_fused(
-            stacked_grads,
-            stacked_params,
-            momentum_buffer,
-            second_momentum_buffer,
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],
-            red_dim,
-        )
+        if use_magma:
+            if "magma_scale" not in state:
+                state["magma_scale"] = torch.ones(num_params, dtype=torch.float32, device=device)
+            _muon_update_eager_(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                state["magma_scale"],
+                momentum=group["momentum"],
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                beta2=beta2,
+                ns_steps=group["ns_steps"],
+                red_dim=red_dim,
+                use_magma=use_magma,
+                survival_prob=survival_prob,
+                temperature=temperature,
+                ema_decay=ema_decay,
+                unbiased=unbiased,
+            )
+        else:
+            # Fill all the 0-D tensors with current values
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(beta2)
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_wd_t.fill_(group["weight_decay"])
+
+            # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
 
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
@@ -351,6 +463,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+              Optional Muon+Magma keys: 'magma', 'survival_prob', 'temperature', 'ema_decay', 'unbiased'
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -471,21 +584,46 @@ class DistMuonAdamW(torch.optim.Optimizer):
         # Build output buffer for all_gather
         updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
 
+        use_magma, survival_prob, temperature, ema_decay, unbiased = _get_muon_magma_hparams(group)
+        beta2 = group["beta2"] if group["beta2"] is not None else 0.0
+
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
 
-            # Fill 0-D tensors and run fused kernel
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
+            if use_magma:
+                if "magma_scale" not in state:
+                    state["magma_scale"] = torch.ones(chunk_size, dtype=torch.float32, device=device)
+                _muon_update_eager_(
+                    grad_chunk[:num_owned],
+                    stacked_owned,
+                    state["momentum_buffer"][:num_owned],
+                    state["second_momentum_buffer"][:num_owned],
+                    state["magma_scale"][:num_owned],
+                    momentum=group["momentum"],
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    beta2=beta2,
+                    ns_steps=group["ns_steps"],
+                    red_dim=red_dim,
+                    use_magma=use_magma,
+                    survival_prob=survival_prob,
+                    temperature=temperature,
+                    ema_decay=ema_decay,
+                    unbiased=unbiased,
+                )
+            else:
+                # Fill 0-D tensors and run fused kernel
+                self._muon_momentum_t.fill_(group["momentum"])
+                self._muon_beta2_t.fill_(beta2)
+                self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+                self._muon_wd_t.fill_(group["weight_decay"])
+                muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
             updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:

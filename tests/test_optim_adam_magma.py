@@ -41,3 +41,24 @@ def test_adam_magma_matches_adamw_when_disabled():
         opt_adamw.step()
 
     assert torch.allclose(p1, p2, atol=1e-7, rtol=1e-6)
+
+
+def test_adam_magma_uses_regular_decoupled_weight_decay():
+    p_base = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float32)
+    grad = torch.tensor([0.25, -0.5, 0.75], dtype=torch.float32)
+    lr = 3e-3
+    wd = 0.1
+
+    p_no_wd = torch.nn.Parameter(p_base.clone())
+    p_wd = torch.nn.Parameter(p_base.clone())
+    common = dict(lr=lr, betas=(0.9, 0.99), eps=1e-8)
+    opt_no_wd = AdamMagma([{"params": [p_no_wd], "magma": True, "survival_prob": 1.0}], weight_decay=0.0, **common)
+    opt_wd = AdamMagma([{"params": [p_wd], "magma": True, "survival_prob": 1.0}], weight_decay=wd, **common)
+
+    p_no_wd.grad = grad.clone()
+    p_wd.grad = grad.clone()
+    opt_no_wd.step()
+    opt_wd.step()
+
+    expected_with_wd = p_no_wd.detach() - lr * wd * p_base
+    assert torch.allclose(p_wd.detach(), expected_with_wd, atol=1e-7, rtol=1e-6)

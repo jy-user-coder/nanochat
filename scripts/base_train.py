@@ -83,16 +83,16 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 
-# Adam+Magma paper defaults:
+# Magma paper defaults (Appendix B.1):
 # https://arxiv.org/pdf/2602.15322v1 (Sec. B.1)
 # - beta1 = 0.9
 # - 10% warmup
 # - cosine decay to 10% of initial LR
-# We conditionally switch parser defaults only when --matrix-optimizer adam_magma is requested.
+# We conditionally switch parser defaults for Magma variants.
 _matrix_optimizer_probe = argparse.ArgumentParser(add_help=False)
 _matrix_optimizer_probe.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "muon_magma", "adam_magma"])
 _probe_args, _ = _matrix_optimizer_probe.parse_known_args()
-if _probe_args.matrix_optimizer == "adam_magma":
+if _probe_args.matrix_optimizer in {"adam_magma", "muon_magma"}:
     parser.set_defaults(
         adam_beta1=0.9,
         warmup_ratio=0.1,
@@ -373,7 +373,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule:
 # - Muon path: linear warmup, constant, linear warmdown
-# - Adam+Magma path: linear warmup, constant, cosine warmdown
+# - Magma paths (Muon+Magma / Adam+Magma): linear warmup, constant, cosine warmdown
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
@@ -383,8 +383,8 @@ def get_lr_multiplier(it):
         return 1.0
     else:
         warmdown_progress = (it - (num_iterations - warmdown_iters)) / warmdown_iters
-        if args.matrix_optimizer == "adam_magma":
-            # Match Adam+Magma paper schedule (cosine decay to final_lr_frac).
+        if args.matrix_optimizer in {"adam_magma", "muon_magma"}:
+            # Match Appendix B.1 paper schedule (cosine decay to final_lr_frac).
             cosine = 0.5 * (1.0 + math.cos(math.pi * warmdown_progress))
             return args.final_lr_frac + (1.0 - args.final_lr_frac) * cosine
         progress = (num_iterations - it) / warmdown_iters

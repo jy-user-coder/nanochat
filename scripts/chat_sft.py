@@ -53,7 +53,11 @@ parser.add_argument("--total-batch-size", type=int, default=None, help="total ba
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
-parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon or Adam+Magma) (default: inherit from pretrain)")
+parser.add_argument("--matrix-optimizer", type=str, default=None, choices=["muon", "adam_magma"], help="matrix optimizer (default: inherit from pretrain, fallback=muon)")
+parser.add_argument("--magma-survival-prob", type=float, default=None, help="Adam+Magma: Bernoulli survival probability (default: inherit or 0.5)")
+parser.add_argument("--magma-temperature", type=float, default=None, help="Adam+Magma: sigmoid temperature (default: inherit or 2.0)")
+parser.add_argument("--magma-ema-decay", type=float, default=None, help="Adam+Magma: EMA decay for damping factor (default: inherit or 0.9)")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -105,6 +109,10 @@ for name, fallback, source in [
     ("embedding_lr",      0.3,   pretrain_user_config),
     ("unembedding_lr",    0.004, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
+    ("matrix_optimizer",  "muon", pretrain_user_config),
+    ("magma_survival_prob", 0.5, pretrain_user_config),
+    ("magma_temperature", 2.0, pretrain_user_config),
+    ("magma_ema_decay",   0.9,  pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -130,9 +138,18 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the optimizer (default: Muon for matrix params, AdamW for the rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    matrix_lr=args.matrix_lr,
+    weight_decay=0.0,
+    matrix_optimizer=args.matrix_optimizer,
+    magma_survival_prob=args.magma_survival_prob,
+    magma_temperature=args.magma_temperature,
+    magma_ema_decay=args.magma_ema_decay,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -428,7 +445,7 @@ while True:
     muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group.get("kind") == 'muon':
             group["momentum"] = muon_momentum
     optimizer.step()
     model.zero_grad(set_to_none=True)

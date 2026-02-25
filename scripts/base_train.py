@@ -60,8 +60,12 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--weight-decay", type=float, default=0.2, help="weight decay for matrix parameters (Muon or Adam+Magma)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon or Adam+Magma)")
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adam_magma"], help="optimizer for matrix parameters")
+parser.add_argument("--magma-survival-prob", type=float, default=0.5, help="Bernoulli survival probability for Adam+Magma matrix updates")
+parser.add_argument("--magma-temperature", type=float, default=2.0, help="temperature in sigmoid(cosine/temperature) for Adam+Magma")
+parser.add_argument("--magma-ema-decay", type=float, default=0.9, help="EMA decay for Magma damping factor")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
@@ -299,16 +303,20 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the optimizer (default: Muon for matrix params, AdamW for the rest)
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
-    # Muon hyperparameters
+    # Matrix optimizer hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
+    matrix_optimizer=args.matrix_optimizer,
     weight_decay=weight_decay_scaled,
+    magma_survival_prob=args.magma_survival_prob,
+    magma_temperature=args.magma_temperature,
+    magma_ema_decay=args.magma_ema_decay,
 )
 
 if resuming:
@@ -504,7 +512,7 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group.get("kind") == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()

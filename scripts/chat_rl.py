@@ -53,8 +53,12 @@ parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = d
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon or Adam+Magma)")
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adam_magma"], help="optimizer for matrix parameters")
+parser.add_argument("--magma-survival-prob", type=float, default=0.5, help="Bernoulli survival probability for Adam+Magma")
+parser.add_argument("--magma-temperature", type=float, default=2.0, help="temperature in sigmoid(cosine/temperature) for Adam+Magma")
+parser.add_argument("--magma-ema-decay", type=float, default=0.9, help="EMA decay for Magma damping factor")
+parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for matrix parameters (Muon or Adam+Magma)")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
@@ -205,6 +209,10 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    matrix_optimizer=args.matrix_optimizer,
+    magma_survival_prob=args.magma_survival_prob,
+    magma_temperature=args.magma_temperature,
+    magma_ema_decay=args.magma_ema_decay,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate

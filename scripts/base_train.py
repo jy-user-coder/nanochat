@@ -67,11 +67,11 @@ parser.add_argument("--magma-survival-prob", type=float, default=0.5, help="Bern
 parser.add_argument("--magma-temperature", type=float, default=2.0, help="temperature in sigmoid(cosine/temperature) for Adam+Magma")
 parser.add_argument("--magma-ema-decay", type=float, default=0.9, help="EMA decay for Magma damping factor")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
+parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding (Adam+Magma default: 0.9)")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup (Adam+Magma default: 0.1)")
+parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown (Adam+Magma default: 0.9)")
+parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR (Adam+Magma default: 0.1)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -82,6 +82,23 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+
+# Adam+Magma paper defaults:
+# https://arxiv.org/pdf/2602.15322v1 (Sec. B.1)
+# - beta1 = 0.9
+# - 10% warmup
+# - cosine decay to 10% of initial LR
+# We conditionally switch parser defaults only when --matrix-optimizer adam_magma is requested.
+_matrix_optimizer_probe = argparse.ArgumentParser(add_help=False)
+_matrix_optimizer_probe.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adam_magma"])
+_probe_args, _ = _matrix_optimizer_probe.parse_known_args()
+if _probe_args.matrix_optimizer == "adam_magma":
+    parser.set_defaults(
+        adam_beta1=0.9,
+        warmup_ratio=0.1,
+        warmdown_ratio=0.9,
+        final_lr_frac=0.1,
+    )
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -354,7 +371,9 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# Learning rate schedule:
+# - Muon path: linear warmup, constant, linear warmdown
+# - Adam+Magma path: linear warmup, constant, cosine warmdown
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
@@ -363,8 +382,13 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
+        warmdown_progress = (it - (num_iterations - warmdown_iters)) / warmdown_iters
+        if args.matrix_optimizer == "adam_magma":
+            # Match Adam+Magma paper schedule (cosine decay to final_lr_frac).
+            cosine = 0.5 * (1.0 + math.cos(math.pi * warmdown_progress))
+            return args.final_lr_frac + (1.0 - args.final_lr_frac) * cosine
         progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        return progress * 1.0 + (1.0 - progress) * args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):

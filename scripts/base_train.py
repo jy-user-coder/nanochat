@@ -60,11 +60,11 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="weight decay for matrix parameters (Muon or Adam+Magma)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon or Adam+Magma)")
-parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adam_magma"], help="optimizer for matrix parameters")
-parser.add_argument("--magma-survival-prob", type=float, default=0.5, help="Bernoulli survival probability for Adam+Magma matrix updates")
-parser.add_argument("--magma-temperature", type=float, default=2.0, help="temperature in sigmoid(cosine/temperature) for Adam+Magma")
+parser.add_argument("--weight-decay", type=float, default=0.2, help="weight decay for matrix parameters (Muon, Muon+Magma, or Adam+Magma)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon, Muon+Magma, or Adam+Magma)")
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "muon_magma", "adam_magma"], help="optimizer for matrix parameters")
+parser.add_argument("--magma-survival-prob", type=float, default=0.5, help="Bernoulli survival probability for Magma matrix updates")
+parser.add_argument("--magma-temperature", type=float, default=2.0, help="temperature in sigmoid(cosine/temperature) for Magma")
 parser.add_argument("--magma-ema-decay", type=float, default=0.9, help="EMA decay for Magma damping factor")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding (Adam+Magma default: 0.9)")
@@ -90,7 +90,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 # - cosine decay to 10% of initial LR
 # We conditionally switch parser defaults only when --matrix-optimizer adam_magma is requested.
 _matrix_optimizer_probe = argparse.ArgumentParser(add_help=False)
-_matrix_optimizer_probe.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adam_magma"])
+_matrix_optimizer_probe.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "muon_magma", "adam_magma"])
 _probe_args, _ = _matrix_optimizer_probe.parse_known_args()
 if _probe_args.matrix_optimizer == "adam_magma":
     parser.set_defaults(

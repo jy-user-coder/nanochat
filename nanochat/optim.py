@@ -92,16 +92,17 @@ def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
     momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
-    second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
+    second_momentum_buffer_1: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment for restart pass 1
+    second_momentum_buffer_2: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment for restart pass 2
     momentum_t: Tensor,             # () - 0-D CPU tensor, momentum coefficient
     lr_t: Tensor,                   # () - 0-D CPU tensor, learning rate
     wd_t: Tensor,                   # () - 0-D CPU tensor, weight decay
     beta2_t: Tensor,                # () - 0-D CPU tensor, beta2 for second moment
-    ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
+    _ns_steps: int,                 # kept for API compatibility, currently fixed to 3 in-kernel
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
 ) -> None:
     """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
+    Fused Muon step: momentum -> (polar_express -> variance_reduction) x2 -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
     """
@@ -111,33 +112,36 @@ def muon_step_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-
-    # Variance reduction
+    # Restart PolarExpress + NorMuon variance reduction twice, with 3 NS iterations each.
+    fixed_ns_steps = 3
     beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
+    for second_momentum_buffer in (second_momentum_buffer_1, second_momentum_buffer_2):
+        # Polar express
+        X = g.bfloat16()
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+        if g.size(-2) > g.size(-1): # Tall matrix
+            for a, b, c in polar_express_coeffs[:fixed_ns_steps]:
+                A = X.mT @ X
+                B = b * A + c * (A @ A)
+                X = a * X + X @ B
+        else: # Wide matrix (original math)
+            for a, b, c in polar_express_coeffs[:fixed_ns_steps]:
+                A = X @ X.mT
+                B = b * A + c * (A @ A)
+                X = a * X + B @ X
+        g = X
+
+        # Variance reduction
+        v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+        red_dim_size = g.size(red_dim)
+        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+        v_norm = v_norm_sq.sqrt()
+        second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+        step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+        final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+        g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
     lr = lr_t.to(g.dtype)
@@ -246,11 +250,22 @@ class MuonAdamW(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored, either per-row or per-column
-        if "second_momentum_buffer" not in state:
+        # Two factored second-momentum buffers (one per restart pass, for separate variance reduction state)
+        if "second_momentum_buffer_1" not in state or "second_momentum_buffer_2" not in state:
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        second_momentum_buffer = state["second_momentum_buffer"]
+            if "second_momentum_buffer" in state:
+                # Backward-compatibility for old checkpoints with a single second-momentum buffer.
+                old_buffer = state["second_momentum_buffer"]
+                state["second_momentum_buffer_1"] = old_buffer.clone()
+                state["second_momentum_buffer_2"] = old_buffer.clone()
+                del state["second_momentum_buffer"]
+            else:
+                if "second_momentum_buffer_1" not in state:
+                    state["second_momentum_buffer_1"] = torch.zeros(state_shape, dtype=dtype, device=device)
+                if "second_momentum_buffer_2" not in state:
+                    state["second_momentum_buffer_2"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        second_momentum_buffer_1 = state["second_momentum_buffer_1"]
+        second_momentum_buffer_2 = state["second_momentum_buffer_2"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Stack grads and params (NOTE: this assumes all params have the same shape)
@@ -263,12 +278,13 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
+        # Single fused kernel: momentum -> (polar_express -> variance_reduction) x2 -> update
         muon_step_fused(
             stacked_grads,
             stacked_params,
             momentum_buffer,
-            second_momentum_buffer,
+            second_momentum_buffer_1,
+            second_momentum_buffer_2,
             self._muon_momentum_t,
             self._muon_lr_t,
             self._muon_wd_t,
@@ -336,7 +352,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
     - reduce_scatter the stacked grads so each rank gets its chunk.
     - Each rank computes Muon update only for params it owns.
     - all_gather the updated params back to all ranks.
-    - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
+    - Optimizer state (momentum_buffer, second_momentum_buffer_1, second_momentum_buffer_2) is sharded by chunk.
     - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
       then ignore the padding when copying back.
 
@@ -463,9 +479,19 @@ class DistMuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
+        if "second_momentum_buffer_1" not in state or "second_momentum_buffer_2" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            if "second_momentum_buffer" in state:
+                # Backward-compatibility for old checkpoints with a single second-momentum buffer.
+                old_buffer = state["second_momentum_buffer"]
+                state["second_momentum_buffer_1"] = old_buffer.clone()
+                state["second_momentum_buffer_2"] = old_buffer.clone()
+                del state["second_momentum_buffer"]
+            else:
+                if "second_momentum_buffer_1" not in state:
+                    state["second_momentum_buffer_1"] = torch.zeros(state_shape, dtype=dtype, device=device)
+                if "second_momentum_buffer_2" not in state:
+                    state["second_momentum_buffer_2"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
@@ -482,7 +508,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                state["momentum_buffer"][:num_owned],
+                state["second_momentum_buffer_1"][:num_owned],
+                state["second_momentum_buffer_2"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )

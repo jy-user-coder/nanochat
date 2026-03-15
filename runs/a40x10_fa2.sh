@@ -13,6 +13,8 @@
 # - TOTAL_BATCH_SIZE must be divisible by that number or base_train will assert.
 # - If you lower DEVICE_BATCH_SIZE to avoid OOM, also lower TOTAL_BATCH_SIZE.
 
+set -euo pipefail
+
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 export NANOCHAT_DTYPE="${NANOCHAT_DTYPE:-bfloat16}"

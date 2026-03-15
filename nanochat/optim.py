@@ -327,7 +327,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
     - Large params: reduce_scatter gradients so each rank gets 1/N of the grad, update
       only that slice, then all_gather the updated slices. Optimizer state (exp_avg,
       exp_avg_sq) is sharded - each rank only stores state for its slice.
-      Requires param.shape[0] divisible by world_size.
+      If param.shape[0] does not divide world_size, we zero-pad the leading dimension
+      for communication and ignore the padded rows when copying back.
 
     Muon Communication (stacked + chunked):
     - All params in a Muon group must have the same shape (caller's responsibility).
@@ -376,12 +377,24 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
-                # Large params: reduce_scatter
-                assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
+                # Large params: reduce_scatter with optional zero-padding on dim 0.
+                rank_size = (grad.shape[0] + world_size - 1) // world_size
+                padded_rows = rank_size * world_size
+                if padded_rows == grad.shape[0]:
+                    grad_buffer = grad
+                else:
+                    grad_buffer = grad.new_zeros((padded_rows, *grad.shape[1:]))
+                    grad_buffer[:grad.shape[0]].copy_(grad)
+                grad_slice = grad.new_empty((rank_size, *grad.shape[1:]))
+                future = dist.reduce_scatter_tensor(grad_slice, grad_buffer, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                param_infos[p] = dict(
+                    future=future,
+                    grad_slice=grad_slice,
+                    is_small=False,
+                    rank_size=rank_size,
+                    num_rows=grad.shape[0],
+                    padded_rows=padded_rows,
+                )
         return dict(param_infos=param_infos)
 
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
@@ -417,9 +430,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # For small params, operate on full param; for large, operate on slice
             if pinfo['is_small']:
                 p_slice = p
+                num_owned = None
             else:
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                rank_size = pinfo['rank_size']
+                start = rank * rank_size
+                num_owned = min(rank_size, max(0, pinfo['num_rows'] - start))
+                p_slice = p.new_zeros((rank_size, *p.shape[1:]))
+                if num_owned > 0:
+                    p_slice[:num_owned].copy_(p[start:start + num_owned])
 
             # State init
             if not state:
@@ -435,16 +453,24 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(
-                p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-            )
+            if pinfo['is_small']:
+                adamw_step_fused(
+                    p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                    self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                    self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+                )
+            elif num_owned > 0:
+                adamw_step_fused(
+                    p_slice[:num_owned], grad_slice[:num_owned], state['exp_avg'][:num_owned], state['exp_avg_sq'][:num_owned],
+                    self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                    self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+                )
 
             # Large params need all_gather
             if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                gather_list.append(dict(future=future, params=None))
+                gathered = p.new_empty((pinfo['padded_rows'], *p.shape[1:]))
+                future = dist.all_gather_into_tensor(gathered, p_slice, async_op=True).get_future()
+                gather_list.append(dict(future=future, param=p, gathered=gathered, num_rows=pinfo['num_rows'], params=None))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
@@ -500,7 +526,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
             info["future"].wait()
-            if info["params"] is not None:
+            if info.get("param") is not None:
+                info["param"].copy_(info["gathered"][:info["num_rows"]])
+            elif info["params"] is not None:
                 # Muon: copy from stacked buffer back to individual params
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
 

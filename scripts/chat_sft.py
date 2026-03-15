@@ -21,7 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA2, HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -89,8 +89,18 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+from nanochat.flash_attention import ATTN_IMPL
+if ATTN_IMPL == "fa3":
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected).")
+elif ATTN_IMPL == "fa2":
+    print0("✓ Using Flash Attention 2 (Ampere/Ada/Hopper CUDA backend).")
+else:
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback.")
+    elif HAS_FA2 and COMPUTE_DTYPE not in {torch.bfloat16, torch.float16}:
+        print0(f"WARNING: Flash Attention 2 requires bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback.")
+    else:
+        print0("WARNING: Flash Attention 2/3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)

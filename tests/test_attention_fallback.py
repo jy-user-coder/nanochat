@@ -1,5 +1,5 @@
 """
-Test Flash Attention unified interface - verify FA3 and SDPA produce identical results.
+Test Flash Attention unified interface - verify FA3/FA2/SDPA produce sane results.
 
 Run: python -m pytest tests/test_attention_fallback.py -v -s
 
@@ -16,24 +16,34 @@ Note on test structure:
 import torch
 import pytest
 import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
+from nanochat.flash_attention import flash_attn, HAS_FA2, HAS_FA3
 from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
+    """Set the implementation override ('fa3', 'fa2', 'sdpa', or None for auto)."""
     fa_module._override_impl = impl
-    fa_module.USE_FA3 = fa_module._resolve_use_fa3()
+    fa_module._refresh_runtime_flags()
+
+
+def run_impl_pair(primary_impl, reference_impl, fn):
+    """Run a function with two implementations, return both outputs."""
+    set_impl(primary_impl)
+    out_primary = fn()
+    set_impl(reference_impl)
+    out_reference = fn()
+    set_impl(None)  # reset
+    return out_primary, out_reference
 
 
 def run_both_impls(fn):
     """Run a function with both FA3 and SDPA, return both outputs."""
-    set_impl('fa3')
-    out_fa3 = fn()
-    set_impl('sdpa')
-    out_sdpa = fn()
-    set_impl(None)  # reset
-    return out_fa3, out_sdpa
+    return run_impl_pair('fa3', 'sdpa', fn)
+
+
+def run_fa2_vs_sdpa(fn):
+    """Run a function with both FA2 and SDPA, return both outputs."""
+    return run_impl_pair('fa2', 'sdpa', fn)
 
 
 def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
@@ -248,6 +258,43 @@ class TestFA3VsSDPA:
         print(f"v_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
 
+@pytest.mark.skipif(not HAS_FA2, reason="FA2 required to compare implementations")
+class TestFA2VsSDPA:
+    """Compare FA2 and SDPA on Ampere/Ada/Hopper CUDA."""
+
+    DEVICE = "cuda"
+    DTYPE = torch.bfloat16
+
+    def test_basic_causal(self):
+        """Basic causal attention."""
+        B, T, H, D = 2, 64, 4, 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+
+        y_fa2, y_sdpa = run_fa2_vs_sdpa(run)
+        max_diff, mean_diff = assert_close(y_fa2, y_sdpa, "fa2_basic_causal")
+        print(f"fa2_basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_sliding_window(self):
+        """Sliding window attention."""
+        B, T, H, D = 2, 128, 4, 32
+        window = 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0))
+
+        y_fa2, y_sdpa = run_fa2_vs_sdpa(run)
+        max_diff, mean_diff = assert_close(y_fa2, y_sdpa, "fa2_sliding_window")
+        print(f"fa2_sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+
 # =============================================================================
 # SDPA-only tests (run on any device)
 # =============================================================================
@@ -345,18 +392,31 @@ class TestOverrideMechanism:
         """Test that override='fa3' uses FA3."""
         set_impl('fa3')
         assert fa_module.USE_FA3 == True
+        assert fa_module.ATTN_IMPL == 'fa3'
+        set_impl(None)
+
+    @pytest.mark.skipif(not HAS_FA2, reason="FA2 required")
+    def test_override_fa2(self):
+        """Test that override='fa2' uses FA2."""
+        set_impl('fa2')
+        assert fa_module.USE_FA2 == True
+        assert fa_module.ATTN_IMPL == 'fa2'
         set_impl(None)
 
     def test_override_sdpa(self):
         """Test that override='sdpa' uses SDPA."""
         set_impl('sdpa')
         assert fa_module.USE_FA3 == False
+        assert fa_module.USE_FA2 == False
+        assert fa_module.ATTN_IMPL == 'sdpa'
         set_impl(None)
 
     def test_override_auto(self):
         """Test that override=None uses auto-detection."""
         set_impl(None)
-        assert fa_module.USE_FA3 == HAS_FA3
+        assert fa_module.ATTN_IMPL in {'fa3', 'fa2', 'sdpa'}
+        assert fa_module.USE_FA3 == (fa_module.ATTN_IMPL == 'fa3')
+        assert fa_module.USE_FA2 == (fa_module.ATTN_IMPL == 'fa2')
 
 
 if __name__ == "__main__":
@@ -367,6 +427,7 @@ if __name__ == "__main__":
         major, minor = torch.cuda.get_device_capability()
         print(f"Compute capability: {major}.{minor}")
     print(f"HAS_FA3: {HAS_FA3}")
+    print(f"HAS_FA2: {HAS_FA2}")
     print()
 
     pytest.main([__file__, "-v", "-s"])

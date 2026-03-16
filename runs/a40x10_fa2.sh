@@ -26,6 +26,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-1146880}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
+FLASH_ATTN_WHEEL_URL="${FLASH_ATTN_WHEEL_URL:-https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl}"
 
 WORLD_TOKENS=$((NPROC_PER_NODE * DEVICE_BATCH_SIZE * MAX_SEQ_LEN))
 if [ $((TOTAL_BATCH_SIZE % WORLD_TOKENS)) -ne 0 ]; then
@@ -38,7 +39,7 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --extra gpu
 
 if ! .venv/bin/python -c "import flash_attn" >/dev/null 2>&1; then
-    uv pip install --python .venv/bin/python --no-build-isolation "flash-attn>=2.7.4.post1"
+    uv pip install --python .venv/bin/python --no-build-isolation "$FLASH_ATTN_WHEEL_URL"
 fi
 
 source .venv/bin/activate

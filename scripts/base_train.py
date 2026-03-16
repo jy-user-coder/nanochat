@@ -101,6 +101,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 
 # Flash Attention status
 from nanochat.flash_attention import ATTN_IMPL
+window_pattern = args.window_pattern.upper()
+fa2_sssl_active = ATTN_IMPL == "fa2" and window_pattern == "SSSL"
 if ATTN_IMPL == "fa3":
     print0("✓ Using Flash Attention 3 (Hopper GPU detected).")
 elif ATTN_IMPL == "fa2":
@@ -120,6 +122,7 @@ else:
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
+print0(f"FA2+SSSL active: {'yes' if fa2_sssl_active else 'no'} (backend={ATTN_IMPL}, window_pattern={window_pattern})")
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model

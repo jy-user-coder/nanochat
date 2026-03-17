@@ -7,6 +7,8 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+from functools import lru_cache
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -77,73 +79,135 @@ Some of the changes in nanochat implementation:
 - Makes no assumptions about model architecture (e.g. that attention weights are fused into QKVO format)
 """
 
-# Coefficients for Polar Express (computed for num_iters=5, safety_factor=2e-2, cushion=2)
-# From https://arxiv.org/pdf/2505.16932
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+MAX_POLAR_EXPRESS_ITERS = 7
 
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(
-    stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
-    stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
-    momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
-    second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
-    momentum_t: Tensor,             # () - 0-D CPU tensor, momentum coefficient
-    lr_t: Tensor,                   # () - 0-D CPU tensor, learning rate
-    wd_t: Tensor,                   # () - 0-D CPU tensor, weight decay
-    beta2_t: Tensor,                # () - 0-D CPU tensor, beta2 for second moment
-    ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
-    red_dim: int,                   # -1 or -2 - reduction dimension for variance
-) -> None:
-    """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
-    """
+# Coefficients generated from the reference optimal_composition(l=1e-3, cushion=0.02, safety=1.02)
+# script shared in the Polar Express paper discussion. Each entry is optimized for that exact total
+# number of Polar Express iterations, so e.g. the 3-step coefficients are not just a prefix of the
+# 7-step ones.
+POLAR_EXPRESS_COEFFS_BY_ITERS = {
+    1: (
+        (8.31968561540051, -23.85945031896673, 17.53144504181025),
+    ),
+    2: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.123788533870074, -2.980845686162055, 0.5520601040380069),
+    ),
+    3: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.969501158338514, -2.9421823632678334, 0.5587364505634643),
+    ),
+    4: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+        (3.351468730910765, -2.513077963371046, 0.5128347598303029),
+    ),
+    5: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+        (3.285753657755652, -2.368129493342536, 0.46449024233003067),
+        (2.346541325859638, -1.7097828382687068, 0.4232355116930525),
+    ),
+    6: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+        (3.285753657755652, -2.368129493342536, 0.46449024233003067),
+        (2.300530711627096, -1.6111665557258394, 0.3833374427545273),
+        (1.9003834757310256, -1.2779237188293076, 0.3778031533636324),
+    ),
+    7: (
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+        (3.285753657755652, -2.368129493342536, 0.46449024233003067),
+        (2.300530711627096, -1.6111665557258394, 0.3833374427545273),
+        (1.8631210546382604, -1.2042160621002738, 0.3421879560523387),
+        (1.8750223595291189, -1.2500248436961239, 0.3750024843776771),
+    ),
+}
 
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
+def _validate_ns_steps(ns_steps: int) -> None:
+    if ns_steps not in POLAR_EXPRESS_COEFFS_BY_ITERS:
+        raise ValueError(
+            f"Unsupported Polar Express iteration count: {ns_steps}. "
+            f"Expected an integer in [1, {MAX_POLAR_EXPRESS_ITERS}]."
+        )
 
-    # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
 
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+@lru_cache(maxsize=None)
+def get_muon_step_fused(ns_steps: int):
+    _validate_ns_steps(ns_steps)
+    polar_express_coeffs = POLAR_EXPRESS_COEFFS_BY_ITERS[ns_steps]
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _muon_step_fused(
+        stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
+        stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
+        momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
+        second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
+        momentum_t: Tensor,             # () - 0-D CPU tensor, momentum coefficient
+        lr_t: Tensor,                   # () - 0-D CPU tensor, learning rate
+        wd_t: Tensor,                   # () - 0-D CPU tensor, weight decay
+        beta2_t: Tensor,                # () - 0-D CPU tensor, beta2 for second moment
+        use_nor_muon_t: Tensor,         # () - 0-D CPU tensor, 1 = enable NorMuon variance reduction
+        red_dim: int,                   # -1 or -2 - reduction dimension for variance
+    ) -> None:
+        """
+        Fused Muon step: momentum -> polar_express -> optional variance_reduction -> cautious_update
+        All in one compiled graph to eliminate Python overhead between ops.
+        Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+        """
+
+        # Nesterov momentum
+        momentum = momentum_t.to(stacked_grads.dtype)
+        momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+        g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+        # Polar express
+        X = g.bfloat16()
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+        if g.size(-2) > g.size(-1): # Tall matrix
+            for a, b, c in polar_express_coeffs:
+                A = X.mT @ X
+                B = b * A + c * (A @ A)
+                X = a * X + X @ B
+        else: # Wide matrix (original math)
+            for a, b, c in polar_express_coeffs:
+                A = X @ X.mT
+                B = b * A + c * (A @ A)
+                X = a * X + B @ X
+        g = X
+
+        # Optional NorMuon variance reduction. When disabled, keep the update unchanged.
+        beta2 = beta2_t.to(g.dtype)
+        use_nor_muon = use_nor_muon_t.to(g.dtype)
+        v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+        red_dim_size = g.size(red_dim)
+        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+        v_norm = v_norm_sq.sqrt()
+        second_momentum_buffer.lerp_(
+            v_mean.to(dtype=second_momentum_buffer.dtype),
+            use_nor_muon * (1 - beta2),
+        )
+        step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+        nor_muon_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+        final_scale = torch.ones_like(nor_muon_scale) + use_nor_muon * (nor_muon_scale - 1)
+        g = g * final_scale.to(g.dtype)
+
+        # Cautious weight decay + parameter update
+        lr = lr_t.to(g.dtype)
+        wd = wd_t.to(g.dtype)
+        mask = (g * stacked_params) >= 0
+        stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+    return _muon_step_fused
 
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
@@ -173,7 +237,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'params': List of parameters
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'use_nor_muon', 'weight_decay'
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -190,6 +254,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_use_nor_muon_t = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group: dict) -> None:
         """
@@ -260,10 +325,12 @@ class MuonAdamW(torch.optim.Optimizer):
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_use_nor_muon_t.fill_(1.0 if group.get("use_nor_muon", True) else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
         # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
+        muon_step_fused = get_muon_step_fused(group["ns_steps"])
         muon_step_fused(
             stacked_grads,
             stacked_params,
@@ -273,7 +340,7 @@ class MuonAdamW(torch.optim.Optimizer):
             self._muon_lr_t,
             self._muon_wd_t,
             self._muon_beta2_t,
-            group["ns_steps"],
+            self._muon_use_nor_muon_t,
             red_dim,
         )
 
@@ -351,7 +418,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - 'params': List of parameters
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'use_nor_muon', 'weight_decay'
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -366,6 +433,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_use_nor_muon_t = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -503,14 +571,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
+            self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+            self._muon_use_nor_muon_t.fill_(1.0 if group.get("use_nor_muon", True) else 0.0)
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
+            muon_step_fused = get_muon_step_fused(group["ns_steps"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
+                self._muon_use_nor_muon_t, red_dim,
             )
             updated_params[:num_owned].copy_(stacked_owned)
 

@@ -64,6 +64,8 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--polar-express-iters", type=int, default=5, help="number of Polar Express orthogonalization iterations for Muon (1-7)")
+parser.add_argument("--use-normuon", type=int, choices=[0, 1], default=1, help="enable NorMuon variance reduction for Muon updates (1=yes, 0=no)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -320,6 +322,8 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    polar_express_iters=args.polar_express_iters,
+    use_nor_muon=bool(args.use_normuon),
 )
 
 if resuming:

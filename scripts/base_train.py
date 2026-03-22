@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA2, HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -100,21 +100,29 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+from nanochat.flash_attention import ATTN_IMPL
+window_pattern = args.window_pattern.upper()
+fa2_sssl_active = ATTN_IMPL == "fa2" and window_pattern == "SSSL"
+if ATTN_IMPL == "fa3":
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected).")
+elif ATTN_IMPL == "fa2":
+    print0("✓ Using Flash Attention 2 (Ampere/Ada/Hopper CUDA backend). Sliding-window attention stays fast.")
 else:
     print0("!" * 80)
     if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    elif HAS_FA2 and COMPUTE_DTYPE not in {torch.bfloat16, torch.float16}:
+        print0(f"WARNING: Flash Attention 2 requires bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+        print0("WARNING: Flash Attention 2/3 not available, using PyTorch SDPA fallback")
+        if device_type == "cuda":
+            print0("WARNING: Install flash-attn on Ampere/Ada GPUs to speed up local-attention training.")
+    print0("WARNING: Training will be less efficient without Flash Attention")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
+print0(f"FA2+SSSL active: {'yes' if fa2_sssl_active else 'no'} (backend={ATTN_IMPL}, window_pattern={window_pattern})")
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -313,6 +321,7 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
+estimated_collective_bus_bytes = optimizer.estimate_collective_bus_bytes()
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -504,8 +513,9 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    should_log_train = step % 100 == 0
     synchronize()
-    t0 = time.time()
+    t_step_start = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -515,6 +525,9 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    if should_log_train:
+        synchronize()
+        t_fwdbwd_end = time.time()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -524,6 +537,7 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    t_opt_start = time.time()
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -536,11 +550,18 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    t_opt_end = time.time()
+    model.zero_grad(set_to_none=True)
+    t_step_end = time.time()
+    train_loss_f = train_loss.item()
+    dt = t_step_end - t_step_start
+    if should_log_train:
+        fwdbwd_ms = (t_fwdbwd_end - t_step_start) * 1000.0
+        opt_step_ms = (t_opt_end - t_opt_start) * 1000.0
+        step_ms = dt * 1000.0
+        opt_frac = opt_step_ms / step_ms if step_ms > 0 else 0.0
+        app_busbw_proxy_GBps = estimated_collective_bus_bytes / (opt_step_ms / 1000.0) / 1e9 if opt_step_ms > 0 else 0.0
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -564,7 +585,7 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if should_log_train:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -575,6 +596,10 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/fwdbwd_ms": fwdbwd_ms,
+            "train/opt_step_ms": opt_step_ms,
+            "train/opt_frac": opt_frac,
+            "train/app_busbw_proxy_GBps": app_busbw_proxy_GBps,
         }
         wandb_run.log(log_data)
 

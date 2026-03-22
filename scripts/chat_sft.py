@@ -21,7 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA2, HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -89,8 +89,18 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+from nanochat.flash_attention import ATTN_IMPL
+if ATTN_IMPL == "fa3":
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected).")
+elif ATTN_IMPL == "fa2":
+    print0("✓ Using Flash Attention 2 (Ampere/Ada/Hopper CUDA backend).")
+else:
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback.")
+    elif HAS_FA2 and COMPUTE_DTYPE not in {torch.bfloat16, torch.float16}:
+        print0(f"WARNING: Flash Attention 2 requires bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback.")
+    else:
+        print0("WARNING: Flash Attention 2/3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -132,6 +142,7 @@ token_bytes = get_token_bytes(device=device)
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
 optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+estimated_collective_bus_bytes = optimizer.estimate_collective_bus_bytes()
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -427,8 +438,9 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    should_log_train = (step + 1) % 10 == 0
     synchronize()
-    t0 = time.time()
+    t_step_start = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -439,6 +451,9 @@ while True:
             loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
+    if should_log_train:
+        synchronize()
+        t_fwdbwd_end = time.time()
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
@@ -446,6 +461,7 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+    t_opt_start = time.time()
     if scaler is not None:
         scaler.unscale_(optimizer)
         if is_ddp_initialized():
@@ -455,10 +471,17 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
     synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    t_opt_end = time.time()
+    model.zero_grad(set_to_none=True)
+    t_step_end = time.time()
+    dt = t_step_end - t_step_start
+    if should_log_train:
+        fwdbwd_ms = (t_fwdbwd_end - t_step_start) * 1000.0
+        opt_step_ms = (t_opt_end - t_opt_start) * 1000.0
+        step_ms = dt * 1000.0
+        opt_frac = opt_step_ms / step_ms if step_ms > 0 else 0.0
+        app_busbw_proxy_GBps = estimated_collective_bus_bytes / (opt_step_ms / 1000.0) / 1e9 if opt_step_ms > 0 else 0.0
     # -------------------------------------------------------------------------
 
     # State
@@ -474,7 +497,7 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
-    if step % 10 == 0:
+    if should_log_train:
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -485,6 +508,10 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
+            "train/fwdbwd_ms": fwdbwd_ms,
+            "train/opt_step_ms": opt_step_ms,
+            "train/opt_frac": opt_frac,
+            "train/app_busbw_proxy_GBps": app_busbw_proxy_GBps,
         })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
